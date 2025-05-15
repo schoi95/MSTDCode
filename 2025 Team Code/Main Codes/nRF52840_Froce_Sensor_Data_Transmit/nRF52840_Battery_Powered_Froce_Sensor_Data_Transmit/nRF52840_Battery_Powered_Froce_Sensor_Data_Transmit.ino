@@ -7,47 +7,29 @@
   the following URL: https://wiki.seeedstudio.com/XIAO_BLE/
 */
 
-// =====================
-// VARIABLE DESCRIPTIONS
-// =====================
-// calibrationFactor      → Adjusts raw HX711 output to pounds
-// bleInterval            → Delay between BLE transmissions (ms)
-// testDuration           → Duration of test session (ms)
-// baselineOffset         → Weight offset from initial tare (lbs)
-// lastValidReading       → Most recent force reading (lbs)
-// peakForce              → Highest force recorded during test
-// testActive             → Indicates if a test session is currently running
-// testStartTime          → Timestamp when the test started
-// previousMillis         → Tracks last BLE update timestamp
-// connectionMillis       → Tracks time when BLE central connected
-// blinkTimer             → Timestamp for blinking logic (LED)
-// blinkState             → LED state toggle (used for flashing)
-// isAdvertising          → Tracks advertising state manually (since BLE.advertising() doesn't exist)
-
-// =====================
-// PIN ASSIGNMENTS
-// =====================
 #include <ArduinoBLE.h>
 #include "HX711.h"
 
-#define DOUT 2               // HX711 data pin
-#define CLK 3                // HX711 clock pin
-#define RED_LED   10         // Red status LED
-#define GREEN_LED 11         // Green status LED
-#define BLUE_LED  12         // Blue status LED
-#define BUTTON_PIN 4         // Jumper-wire trigger input
+// === PIN DEFINITIONS ===
+#define DOUT       2     // HX711 data pin
+#define CLK        3     // HX711 clock pin
+#define RED_LED    10    // Onboard RGB - Red channel
+#define GREEN_LED  11    // Onboard RGB - Green channel
+#define BUTTON_PIN 4     // Jumper wire input for test start
 
+// === BLE SERVICE SETUP ===
+BLEService forceService("180C");  // Custom BLE service UUID
+BLECharacteristic forceDataCharacteristic("2A56", BLERead | BLENotify, 50);  // Transmit force data
+
+// === HX711 INSTANCE ===
 HX711 scale;
 
-BLEService forceService("180C");  // Custom BLE service
-BLECharacteristic forceDataCharacteristic("2A56", BLERead | BLENotify, 50);  // Transmits force readings
+// === CONSTANTS ===
+const float calibrationFactor = -20767.5;      // Convert raw scale readings to pounds
+const long bleInterval = 500;                  // How often to send data (ms)
+const unsigned long testDuration = 10000;      // Test session length in ms (10 seconds)
 
-// Calibration and timing constants
-const float calibrationFactor = -20767.5;  // Convert HX711 value to pounds
-const long bleInterval = 500;              // BLE update interval (ms)
-const unsigned long testDuration = 10000;  // Test length = 10 seconds
-
-// Runtime variables
+// === STATE VARIABLES ===
 float baselineOffset = 0.0;
 float lastValidReading = 0.0;
 float peakForce = 0.0;
@@ -60,81 +42,96 @@ unsigned long blinkTimer = 0;
 bool blinkState = false;
 bool isAdvertising = false;
 
-void setLED(bool r, bool g, bool b) {
+// === LED CONTROL FUNCTION ===
+// Turns on/off onboard RGB LED channels.
+// Common-anode LED → LOW = ON, HIGH = OFF
+void setLED(bool r, bool g) {
   digitalWrite(RED_LED, r ? LOW : HIGH);
   digitalWrite(GREEN_LED, g ? LOW : HIGH);
-  digitalWrite(BLUE_LED, b ? LOW : HIGH);
 }
 
 void setup() {
+  // Setup serial monitor
+  Serial.begin(115200);
+  delay(1000);  // Wait for Serial to connect
+
+  // Set LED and button pin modes
   pinMode(RED_LED, OUTPUT);
   pinMode(GREEN_LED, OUTPUT);
-  pinMode(BLUE_LED, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);  // Jumper input
+  pinMode(BUTTON_PIN, INPUT_PULLUP);  // Jumper input triggers LOW
 
-  setLED(true, false, false);  // Solid red = not connected
+  // Show red LED during startup
+  setLED(true, false);
 
-  // Initialize HX711
+  // Initialize scale
   scale.begin(DOUT, CLK);
   delay(100);
-  while (!scale.is_ready()) {
-    delay(100);
-  }
-
+  while (!scale.is_ready()) delay(100);  // Wait for scale to be ready
   scale.set_scale(calibrationFactor);
-  scale.tare();
+  scale.tare();  // Tare the scale to 0
   delay(1000);
-  baselineOffset = scale.get_units(10);  // Baseline tare offset
+  baselineOffset = scale.get_units(10);  // Store baseline
 
   // Initialize BLE
   if (!BLE.begin()) {
-    setLED(true, false, false); // Red = BLE failed
+    setLED(true, false);  // Red = BLE startup failed
     while (1);
   }
 
+  // BLE configuration
   BLE.setLocalName("XIAO_nRF52840");
   BLE.setAdvertisedService(forceService);
   forceService.addCharacteristic(forceDataCharacteristic);
   BLE.addService(forceService);
 
+  // Start advertising
   BLE.advertise();
   isAdvertising = true;
-
   blinkTimer = millis();
+
+  Serial.println("BLE advertising started...");
 }
 
 void loop() {
-  BLEDevice central = BLE.central();
+  BLE.poll();  // Keep BLE stack alive
+  BLEDevice central = BLE.central();  // Check if a central connects
 
+  // === BLE CONNECTION HANDLING ===
   if (central) {
+    Serial.println("Central connected");
+
+    // Reset state variables
     connectionMillis = millis();
     previousMillis = 0;
     blinkTimer = millis();
     blinkState = false;
     isAdvertising = false;
 
+    // Stay in loop while connected
     while (central.connected()) {
       unsigned long currentMillis = millis();
 
-      // Jumper wire trigger to start test
+      // === Start test if jumper/button is pressed ===
       if (!testActive && digitalRead(BUTTON_PIN) == LOW) {
         testActive = true;
         testStartTime = currentMillis;
         peakForce = 0.0;
+        Serial.println("Test started");
       }
 
-      // LED Behavior: Flash green during test, solid when idle
+      // === LED FEEDBACK ===
       if (testActive) {
+        // Flash green during test
         if (currentMillis - blinkTimer >= 500) {
           blinkState = !blinkState;
           blinkTimer = currentMillis;
-          setLED(false, blinkState, false);  // Flash green
+          setLED(false, blinkState);  // Flash green
         }
       } else {
-        setLED(false, true, false);  // Solid green = connected
+        setLED(false, true);  // Solid green when connected but idle
       }
 
-      // BLE transmission
+      // === BLE Data Transmission ===
       if (currentMillis - previousMillis >= bleInterval) {
         previousMillis = currentMillis;
 
@@ -142,28 +139,34 @@ void loop() {
           float pounds = abs(scale.get_units(5) - baselineOffset);
           lastValidReading = pounds;
 
+          // Format data as "time|value"
           char message[40];
           snprintf(message, sizeof(message), "%lu|%.1f", currentMillis - connectionMillis, pounds);
           forceDataCharacteristic.writeValue((uint8_t*)message, strlen(message));
 
+          // Check for peak force & test timeout
           if (testActive) {
             if (pounds > peakForce) peakForce = pounds;
             if ((currentMillis - testStartTime) >= testDuration) {
               testActive = false;
+              Serial.print("Peak force: ");
+              Serial.println(peakForce);
             }
           }
         }
       }
     }
 
-    // Connection lost → resume advertising
-    BLE.advertise();
+    // === BLE DISCONNECTED ===
+    Serial.println("Disconnected from central");
+    central.disconnect();
+    BLE.advertise();  // Restart advertising
     isAdvertising = true;
     blinkTimer = millis();
     blinkState = false;
   }
 
-  // LED behavior when disconnected
+  // === LED FEEDBACK WHEN DISCONNECTED ===
   if (!BLE.connected()) {
     unsigned long now = millis();
 
@@ -171,10 +174,10 @@ void loop() {
       if (now - blinkTimer >= 500) {
         blinkState = !blinkState;
         blinkTimer = now;
-        setLED(false, false, blinkState);  // Flash blue = advertising
+        setLED(blinkState, false);  // Flash red (simulating advertising)
       }
     } else {
-      setLED(true, false, false);  // Solid red = idle
+      setLED(true, false);  // Solid red = not advertising, idle
     }
   }
 }
